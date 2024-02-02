@@ -105,7 +105,7 @@ SIM800L::SIM800L(UART_HandleTypeDef* huart, GPIO_TypeDef *GPIOx, uint16_t pinNum
 	this->isReceive = true;
 	this->isSend = true;
 	this->jsonDownloadSecondsDelay = 1;
-	this->errorCounter = 0;
+	this->errorCounter = 10;
 
 	this->reset.GPIOx = GPIOx;
 	this->reset.pin = pinNumber;
@@ -141,6 +141,9 @@ SIM800L::SIM800L(UART_HandleTypeDef* huart, GPIO_TypeDef *GPIOx, uint16_t pinNum
 
 	this->status.Session = GPRSSessionStatus::NotOpened;
 	this->status.Status = GPRSSessionStatus::NotOpened;
+
+	this->regStatus.typeCode = GPRSRegTypesCode::NoCode;
+	this->regStatus.registerCode = GPRSRegCode::NotRegistred;
 }
 
 bool SIM800L::simReadyState() {
@@ -625,7 +628,7 @@ HTTPStatuses SIM800L::sendHTTP(HTTPActions a) {
 	bool is600 = this->parse600();
 	if (is600) {
 		this->errorCounter += 1;
-		this->checkErrors();
+		this->trySoftReset();
 
 		return HTTPStatuses::Error600;
 	}
@@ -635,6 +638,7 @@ HTTPStatuses SIM800L::sendHTTP(HTTPActions a) {
 
 	bool code = this->parse200();
 	if (code) {
+		this->errorCounter = 0;
 		return HTTPStatuses::Success;
 	}
 
@@ -642,6 +646,9 @@ HTTPStatuses SIM800L::sendHTTP(HTTPActions a) {
 	if(code) {
 		return HTTPStatuses::BadRequest;
 	}
+
+	this->errorCounter += 1;
+	this->trySoftReset();
 
 	return HTTPStatuses::UndefinedError;
 }
@@ -651,13 +658,17 @@ HTTPStatuses SIM800L::resendJson() {	// TODO: realize
 	status = this->setHTTPURL(this->url.url, this->url.size);
 	status = this->downloadJson(this->lastJson.json, this->lastJson.size);
 
+	if (status == false) {
+		return HTTPStatuses::UndefinedError;
+	}
+
 	return this->sendHTTP(HTTPActions::POST);
 }
 
 bool SIM800L::defaultHTTPSettings() {
 	bool status = false;
 	status = this->setHTTPSSL();
-	status = this->setContentTypeJson(); // TODO: can stuckin retry
+	status = this->setContentTypeJson();
 	status = this->setHTTPIdentifier();
 	status = this->setURL();
 
@@ -744,6 +755,8 @@ void SIM800L::sendBearerCredentials(char command[], const char params[], uint8_t
  *
  * WARNING!
  * Dont use it. Lib is not adapted for this func
+ *
+ * TODO: to uint8
  */
 bool SIM800L::setErrorLevel(const char* level) {
 	char command[CMEE_SIZE_SEND] = "AT+CMEE=2";
@@ -912,10 +925,70 @@ bool SIM800L::checkGPRSClosed() {
 	}
 }
 
-bool SIM800L::checkErrors() {
-	if(this->errorCounter == MAX_ERRORS_FOR_RESTART) {
-		// TODO: restart
+SIMResetState SIM800L::checkErrors() {
+	if(this->errorCounter >= MAX_ERRORS_FOR_RESTART) {
+		this->readIT(50);
+		this->sendIT("AT+CFUN=1,1\n", 12);
+
+		bool status = this->waitReceiveLess(200);
+		if (status != true) {
+			status = this->retry("AT+CFUN=1,1\n", 12, 50, 200, true);
+		}
+
+		this->errorCounter = 0;
+		return status ? SIMResetState::Reseted : SIMResetState::Error;
 	}
+
+	return SIMResetState::NotEnoughtErrors;
+}
+
+bool SIM800L::getGPRSRegistration() {
+	this->readIT(200);
+	this->sendIT("AT+CREG?\n", 9);
+
+	bool status = this->waitReceiveLess(200);
+	if(status == false) {
+		status = this->retryWithOpenRx("AT+CREG?\n", 9, 50, 200);
+	}
+
+	status = this->parseOK(200);
+
+	status = this->parseReg(200);
+
+	return status;
+}
+
+SIMResetState SIM800L::trySoftReset() {
+	SIMResetState state = this->checkErrors();
+	if (state == SIMResetState::Reseted) {
+		HAL_Delay(2000);
+		this->getGPRSRegistration();
+
+		while(this->regStatus.typeCode != GPRSRegTypesCode::NoCode ||
+				this->regStatus.registerCode != GPRSRegCode::HomeRegistred)
+		{
+			this->getGPRSRegistration();
+		}
+	}
+
+	return state;
+}
+
+bool SIM800L::parseReg(uint8_t size) {
+	bool result = false;
+	for (uint16_t i = 0; i < size; i++) {
+		if (this->rx_buffer[i] == ':') {
+			if(this->rx_buffer[i-4] == 'C' && this->rx_buffer[i-3] == 'R' && this->rx_buffer[i-2] == 'E') {
+				this->regStatus.typeCode = rx_buffer[i+2];
+				this->regStatus.registerCode = rx_buffer[i+4];
+
+				result = true;
+				break;
+			}
+		}
+	}
+
+	return result;
 }
 
 bool SIM800L::parseDOWNLOAD(uint16_t size) {
@@ -951,6 +1024,12 @@ uint8_t SIM800L::parseUint(char buffer[], uint32_t target, uint8_t parseSize) {
 	}
 }
 
+void SIM800L::clearRX() {
+	for (uint8_t i = 0; i < SIM_ARR_SIZE; ++i) {
+		this->rx_buffer[i] = 0;
+	}
+}
+
 void SIM800L::send(const char* msg, uint16_t size, uint16_t delayMS) {
 	HAL_UART_Transmit(this->huart, (uint8_t*) msg, size, delayMS);
 }
@@ -969,6 +1048,30 @@ bool SIM800L::retry(const char* msg, uint16_t sizeSend, uint16_t sizeReceive, ui
 
 	while(this->isReceive != true) {
 //		this->readIT(sizeReceive);
+		this->sendIT(msg, sizeSend);
+
+		this->waitReceiveLong(timeoutMS);
+	}
+
+	return true;
+}
+
+bool SIM800L::retryWithOpenRx(const char* msg, uint16_t sizeSend, uint16_t sizeReceive, uint32_t timeoutMS, bool isOnce) {
+	if (isOnce) {
+		if (HAL_UART_GetState(this->huart) == HAL_UART_STATE_READY) {
+			this->readIT(sizeReceive);
+		}
+		this->sendIT(msg, sizeSend);
+
+
+		return this->waitReceiveLong(timeoutMS);
+	}
+
+	while(this->isReceive != true) {
+		if (HAL_UART_GetState(this->huart) == HAL_UART_STATE_READY) {
+			this->readIT(sizeReceive);
+		}
+
 		this->sendIT(msg, sizeSend);
 
 		this->waitReceiveLong(timeoutMS);
